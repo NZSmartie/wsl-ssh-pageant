@@ -1,130 +1,138 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 	"unsafe"
-
-	"github.com/hidez8891/shm"
 )
 
 const (
-	WM_COPYDATA = 0x004A
+	wmCopyData       = 0x004A // WM_COPYDATA
+	maxMessageLength = 8192
+	copyDataID       = uintptr(0x804e50ba)
 )
-
-const AgentMaxMessageLength int32 = 8192
-
-const AGENT_MAX_MSGLEN int32 = 8192
-
-const AGENT_COPYDATA_ID uintptr = uintptr(0x804e50ba)
 
 var (
-	user32             = syscall.NewLazyDLL("User32.dll")
-	kernel32           = syscall.NewLazyDLL("kernel32.dll")
-	FindWindow         = user32.NewProc("FindWindowW")
-	GetCurrentThreadId = kernel32.NewProc("GetCurrentThreadId")
-	SendMessage        = user32.NewProc("SendMessage")
+	// Windows DLLs
+	user32   = syscall.NewLazyDLL("User32.dll")
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+
+	// Win32 API imports
+	findWindow         = user32.NewProc("FindWindowW")
+	getCurrentThreadID = kernel32.NewProc("GetCurrentThreadId")
+	createFileMapping  = kernel32.NewProc("CreateFileMapping")
+	sendMessage        = user32.NewProc("SendMessageW")
+
+	queryLock sync.Mutex
 )
 
-type COPYDATASTRUCT struct {
-	dwData uintptr // Any value the sender chooses.  Perhaps its main window handle?
-	cbData int32   // The count of bytes in the message.
-	lpData uintptr // The address of the message.
+type copyDataStruct struct {
+	dwData uintptr
+	cbData uint32
+	lpData unsafe.Pointer
 }
 
 func query(buffer []byte) ([]byte, error) {
-	hwnd, _, err := FindWindow.Call(
-		0,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Pageant"))))
+	queryLock.Lock()
+	defer queryLock.Unlock()
+
+	// fetch the Pageant window.
+	hwnd, _, err := findWindow.Call(0, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Pageant"))))
 	if hwnd == 0 {
-		log.Fatal(os.NewSyscallError(FindWindow.Name, err))
+		return nil, os.NewSyscallError(findWindow.Name, err)
 	}
 
 	// var mapName = String.Format("PageantRequest{0:x8}", GetCurrentThreadId());
-	threadID, _, _ := GetCurrentThreadId.Call()
-	mapName := fmt.Sprintf("PageantRequest%8x", threadID)
+	threadID, _, _ := getCurrentThreadID.Call()
+	mapName := fmt.Sprintf("PageantRequest%08x", threadID)
+	pMapName, _ := syscall.UTF16PtrFromString(mapName)
 
+	mmap, err := syscall.CreateFileMapping(syscall.InvalidHandle, nil, syscall.PAGE_READWRITE, 0, maxMessageLength+4, pMapName)
 	if err != nil {
 		return nil, err
 	}
 
-	// var fileMap = CreateFileMapping(INVALID_HANDLE_VALUE, IntPtr.Zero, FileMapProtection.PageReadWrite, 0, AGENT_MAX_MSGLEN, mapName);
-	sharedMemory, err := shm.Create(mapName, AgentMaxMessageLength)
-	if err != nil {
-		return nil, err
-	}
-	defer sharedMemory.Close()
+	defer syscall.CloseHandle(mmap)
 
-	// Marshal.Copy(buf, 0, sharedMemory, buf.Length);
-	_, err = sharedMemory.Write(buffer)
+	ptr, err := syscall.MapViewOfFile(mmap, syscall.FILE_MAP_WRITE, 0, 0, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	cds := COPYDATASTRUCT{}
-	cds.dwData = AGENT_COPYDATA_ID
-	cds.cbData = int32(len(mapName) + 1)
+	defer syscall.UnmapViewOfFile(ptr)
 
-	// bar[bar.Length - 1] = 0;
-	// var gch = GCHandle.Alloc(bar);
+	mmSlice := (*(*[maxMessageLength + 4]byte)(unsafe.Pointer(ptr)))[:]
 
-	// cds.lpData = Marshal.UnsafeAddrOfPinnedArrayElement(bar, 0);
-	mapNameBytes := append([]byte(mapName), []byte{0}...)
-	copySlice2Ptr(mapNameBytes, cds.lpData, 0, int32(len(mapNameBytes)))
+	// Write our query to the shared memeory
+	copy(mmSlice, buffer)
 
-	// var data = Marshal.AllocHGlobal(Marshal.SizeOf(cds));
-	// Marshal.StructureToPtr(cds, data, false);
-	data := new(bytes.Buffer)
-	err = binary.Write(data, binary.LittleEndian, &cds)
-	var dataPtr uintptr
-	copySlice2Ptr(data.Bytes(), dataPtr, 0, int32(data.Len()))
+	mapNameBytes := append([]byte(mapName), 0)
 
-	// var rcode = SendMessage(hwnd, WM_COPYDATA, IntPtr.Zero, data);
-	_, _, err = SendMessage.Call(hwnd, WM_COPYDATA, 0, dataPtr)
-	if err != nil {
-		return nil, os.NewSyscallError(SendMessage.Name, err)
+	cds := copyDataStruct{
+		dwData: copyDataID,
+		cbData: uint32(len(mapNameBytes)),
+		lpData: unsafe.Pointer(&mapNameBytes[0]),
 	}
 
-	len := make([]byte, 4)
-	sharedMemory.Read(len)
-	// var len = (Marshal.ReadByte(sharedMemory, 0) << 24) |
-	// 			(Marshal.ReadByte(sharedMemory, 1) << 16) |
-	// 			(Marshal.ReadByte(sharedMemory, 2) << 8) |
-	// 			(Marshal.ReadByte(sharedMemory, 3));
+	// Inform pageant of the share memory file name
+	resp, _, err := sendMessage.Call(hwnd, wmCopyData, 0, uintptr(unsafe.Pointer(&cds)))
+	if resp == 0 {
+		return nil, os.NewSyscallError(sendMessage.Name, errors.New("Pageant was not informed of our query"))
+	}
 
-	// var ret = new byte[len + 4];
-	// Marshal.Copy(sharedMemory, ret, 0, len + 4);
-	len = make([]byte, binary.BigEndian.Uint32(len)+4)
-	sharedMemory.Read(len)
+	responseLen := binary.BigEndian.Uint32(mmSlice[:4])
 
-	return len, nil
+	if responseLen > maxMessageLength {
+		return nil, errors.New("Reponse from pagent too large")
+	}
+
+	response := make([]byte, responseLen+4)
+	copy(response, mmSlice)
+
+	return response, nil
 }
 
 func main() {
-
-	// Buffer for reading data
-	inBuffer := new(bytes.Buffer)
+	inReader := bufio.NewReader(os.Stdin)
 
 	defer os.Stdin.Close()
-	// Loop to receive all the data sent by the client.
+
 	for true {
-		inBuffer.Reset()
-		i, err := io.Copy(inBuffer, os.Stdin)
-		if i == 0 || err != nil {
+		// Get the 4 byte length from stdin.
+		header := make([]byte, 4)
+		_, err := inReader.Read(header)
+		if err == io.EOF {
 			break
 		}
+		if err != nil {
 
-		msg, err := query(inBuffer.Bytes())
+			log.Fatal(err)
+		}
+		inputLength := binary.BigEndian.Uint32(header)
+		if inputLength > maxMessageLength {
+			log.Fatal(errors.New("Request message too large"))
+		}
+
+		data := make([]byte, inputLength)
+		_, err = inReader.Read(data)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		outReader := bytes.NewReader(msg)
-		io.Copy(os.Stdout, outReader)
+		data = append(header, data...)
+
+		msg, err := query(data)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		os.Stdout.Write(msg)
 	}
 }
