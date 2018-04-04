@@ -2,7 +2,7 @@
 
 **Now supports multiple ssh connections concurrently!**
 
-A Pageant -> TCP bridge for use with WSL, allowing for Pageant to be used as an ssh-ageant within the WSL environment.
+A Pageant bridge for WSL, enabling ssh-ageants to talk to to PuTTY Pagent or GnuPG for Windows 
 
 ![Demo](demo.gif?raw=True)
 
