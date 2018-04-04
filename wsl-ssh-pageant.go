@@ -46,7 +46,7 @@ func query(buffer []byte) ([]byte, error) {
 	// fetch the Pageant window.
 	hwnd, _, err := findWindow.Call(0, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Pageant"))))
 	if hwnd == 0 {
-		return nil, os.NewSyscallError(findWindow.Name, err)
+		return nil, errors.New("PuTTY Pageant is not running")
 	}
 
 	// var mapName = String.Format("PageantRequest{0:x8}", GetCurrentThreadId());
@@ -109,28 +109,36 @@ func main() {
 		header := make([]byte, 4)
 		_, err := inReader.Read(header)
 		if err == io.EOF {
+			// No More input, exit gracefully
 			break
 		}
 		if err != nil {
 
 			log.Fatal(err)
 		}
+
 		inputLength := binary.BigEndian.Uint32(header)
 		if inputLength > maxMessageLength {
-			log.Fatal(errors.New("Request message too large"))
+			os.Stderr.WriteString("Request message too large")
+			// Return an empty reponse
+			os.Stdout.Write([]byte{0x00, 0x00, 0x00, 0x05, 0x0c, 0x00, 0x00, 0x00, 0x00})
 		}
 
 		data := make([]byte, inputLength)
 		_, err = inReader.Read(data)
 		if err != nil {
-			log.Fatal(err)
+			os.Stderr.WriteString(fmt.Sprintln(err))
+			// Return an empty reponse
+			os.Stdout.Write([]byte{0x00, 0x00, 0x00, 0x05, 0x0c, 0x00, 0x00, 0x00, 0x00})
 		}
 
 		data = append(header, data...)
 
 		msg, err := query(data)
 		if err != nil {
-			log.Fatal(err)
+			os.Stderr.WriteString(fmt.Sprintln(err))
+			// Return an empty reponse
+			os.Stdout.Write([]byte{0x00, 0x00, 0x00, 0x05, 0x0c, 0x00, 0x00, 0x00, 0x00})
 		}
 
 		os.Stdout.Write(msg)
