@@ -1,4 +1,4 @@
-# wsl-ssh-pageant
+# [wsl-ssh-pageant](https://github.com/benpye/wsl-ssh-pageant) ported to Go
 
 **Now supports multiple ssh connections concurrently!**
 
@@ -23,4 +23,6 @@ $ export SSH_AUTH_SOCK=/tmp/wsl-ssh-pageant.socket
 
 ## Credit
 
-Thanks to [John Starks](https://github.com/jstarks/) for [npiperelay](https://github.com/jstarks/npiperelay/), showing a more secure way to create a stream between WSL and Linux.
+Thanks to 
+ - [Ben Pye](https://githib.com/benpye) for his initial work on the C# version of [wsl-ssh-pageant](https://github.com/benpye/wsl-ssh-pageant)
+ - [John Starks](https://github.com/jstarks/) for [npiperelay](https://github.com/jstarks/npiperelay/)
